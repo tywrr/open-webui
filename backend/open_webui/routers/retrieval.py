@@ -1,118 +1,110 @@
+import asyncio
 import json
 import logging
 import mimetypes
 import os
-import shutil
-import asyncio
-
 import re
+import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator, List, Optional, Sequence, Union
 
+import requests
+import tiktoken
 from fastapi import (
+    APIRouter,
     Depends,
     FastAPI,
-    Query,
     File,
     Form,
     HTTPException,
-    UploadFile,
+    Query,
     Request,
+    UploadFile,
     status,
-    APIRouter,
 )
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel
-import tiktoken
-
-
+from fastapi.middleware.cors import CORSMiddleware
+from langchain_core.documents import Document
 from langchain_text_splitters import (
+    MarkdownHeaderTextSplitter,
     RecursiveCharacterTextSplitter,
     TokenTextSplitter,
-    MarkdownHeaderTextSplitter,
 )
-from langchain_core.documents import Document
-
-from open_webui.models.files import FileModel, FileUpdateForm, Files
+from open_webui.config import (
+    DEFAULT_LOCALE,
+    ENV,
+    RAG_EMBEDDING_CONTENT_PREFIX,
+    RAG_EMBEDDING_MODEL_AUTO_UPDATE,
+    RAG_EMBEDDING_MODEL_TRUST_REMOTE_CODE,
+    RAG_EMBEDDING_QUERY_PREFIX,
+    RAG_RERANKING_MODEL_AUTO_UPDATE,
+    RAG_RERANKING_MODEL_TRUST_REMOTE_CODE,
+    UPLOAD_DIR,
+)
+from open_webui.constants import ERROR_MESSAGES
+from open_webui.env import (
+    DEVICE_TYPE,
+    DOCKER,
+    SENTENCE_TRANSFORMERS_BACKEND,
+    SENTENCE_TRANSFORMERS_CROSS_ENCODER_BACKEND,
+    SENTENCE_TRANSFORMERS_CROSS_ENCODER_MODEL_KWARGS,
+    SENTENCE_TRANSFORMERS_MODEL_KWARGS,
+)
+from open_webui.models.files import FileModel, Files, FileUpdateForm
 from open_webui.models.knowledge import Knowledges
-from open_webui.storage.provider import Storage
-
-
-from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
 
 # Document loaders
 from open_webui.retrieval.loaders.main import Loader
 from open_webui.retrieval.loaders.youtube import YoutubeLoader
-
-# Web search engines
-from open_webui.retrieval.web.main import SearchResult
-from open_webui.retrieval.web.utils import get_web_loader
-from open_webui.retrieval.web.ollama import search_ollama_cloud
-from open_webui.retrieval.web.perplexity_search import search_perplexity_search
-from open_webui.retrieval.web.brave import search_brave
-from open_webui.retrieval.web.kagi import search_kagi
-from open_webui.retrieval.web.mojeek import search_mojeek
-from open_webui.retrieval.web.bocha import search_bocha
-from open_webui.retrieval.web.duckduckgo import search_duckduckgo
-from open_webui.retrieval.web.google_pse import search_google_pse
-from open_webui.retrieval.web.jina_search import search_jina
-from open_webui.retrieval.web.searchapi import search_searchapi
-from open_webui.retrieval.web.serpapi import search_serpapi
-from open_webui.retrieval.web.searxng import search_searxng
-from open_webui.retrieval.web.yacy import search_yacy
-from open_webui.retrieval.web.serper import search_serper
-from open_webui.retrieval.web.serply import search_serply
-from open_webui.retrieval.web.serpstack import search_serpstack
-from open_webui.retrieval.web.tavily import search_tavily
-from open_webui.retrieval.web.bing import search_bing
-from open_webui.retrieval.web.azure import search_azure
-from open_webui.retrieval.web.exa import search_exa
-from open_webui.retrieval.web.perplexity import search_perplexity
-from open_webui.retrieval.web.sougou import search_sougou
-from open_webui.retrieval.web.firecrawl import search_firecrawl
-from open_webui.retrieval.web.external import search_external
-
 from open_webui.retrieval.utils import (
     get_content_from_url,
     get_embedding_function,
-    get_reranking_function,
     get_model_path,
+    get_reranking_function,
     query_collection,
     query_collection_with_hybrid_search,
     query_doc,
     query_doc_with_hybrid_search,
 )
+from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
 from open_webui.retrieval.vector.utils import filter_metadata
+from open_webui.retrieval.web.azure import search_azure
+from open_webui.retrieval.web.bing import search_bing
+from open_webui.retrieval.web.bocha import search_bocha
+from open_webui.retrieval.web.brave import search_brave
+from open_webui.retrieval.web.duckduckgo import search_duckduckgo
+from open_webui.retrieval.web.exa import search_exa
+from open_webui.retrieval.web.external import search_external
+from open_webui.retrieval.web.firecrawl import search_firecrawl
+from open_webui.retrieval.web.google_pse import search_google_pse
+from open_webui.retrieval.web.jina_search import search_jina
+from open_webui.retrieval.web.kagi import search_kagi
+
+# Web search engines
+from open_webui.retrieval.web.main import SearchResult
+from open_webui.retrieval.web.mojeek import search_mojeek
+from open_webui.retrieval.web.ollama import search_ollama_cloud
+from open_webui.retrieval.web.perplexity import search_perplexity
+from open_webui.retrieval.web.perplexity_search import search_perplexity_search
+from open_webui.retrieval.web.searchapi import search_searchapi
+from open_webui.retrieval.web.searxng import search_searxng
+from open_webui.retrieval.web.serpapi import search_serpapi
+from open_webui.retrieval.web.serper import search_serper
+from open_webui.retrieval.web.serply import search_serply
+from open_webui.retrieval.web.serpstack import search_serpstack
+from open_webui.retrieval.web.sougou import search_sougou
+from open_webui.retrieval.web.tavily import search_tavily
+from open_webui.retrieval.web.utils import get_web_loader
+from open_webui.retrieval.web.yacy import search_yacy
+from open_webui.storage.provider import Storage
+from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.misc import (
     calculate_sha256_string,
     sanitize_text_for_db,
 )
-from open_webui.utils.auth import get_admin_user, get_verified_user
-
-from open_webui.config import (
-    ENV,
-    RAG_EMBEDDING_MODEL_AUTO_UPDATE,
-    RAG_EMBEDDING_MODEL_TRUST_REMOTE_CODE,
-    RAG_RERANKING_MODEL_AUTO_UPDATE,
-    RAG_RERANKING_MODEL_TRUST_REMOTE_CODE,
-    UPLOAD_DIR,
-    DEFAULT_LOCALE,
-    RAG_EMBEDDING_CONTENT_PREFIX,
-    RAG_EMBEDDING_QUERY_PREFIX,
-)
-from open_webui.env import (
-    DEVICE_TYPE,
-    DOCKER,
-    SENTENCE_TRANSFORMERS_BACKEND,
-    SENTENCE_TRANSFORMERS_MODEL_KWARGS,
-    SENTENCE_TRANSFORMERS_CROSS_ENCODER_BACKEND,
-    SENTENCE_TRANSFORMERS_CROSS_ENCODER_MODEL_KWARGS,
-)
-
-from open_webui.constants import ERROR_MESSAGES
+from pydantic import BaseModel
 
 log = logging.getLogger(__name__)
 
@@ -1495,7 +1487,6 @@ def process_file(
 
     if file:
         try:
-
             collection_name = form_data.collection_name
 
             if collection_name is None:
@@ -1636,6 +1627,37 @@ def process_file(
             )
             hash = calculate_sha256_string(text_content)
             Files.update_file_hash_by_id(file.id, hash)
+
+            # Push to neo4j database.
+            if os.environ.get("NEO4J_GRAPH_INGEST"):
+                try:
+                    SHAKUDO_GRAPH_TOOL_MICROSERVICE = os.getenv(
+                        "SHAKUDO_NEO4J_GRAPH_TOOL_MICROSERVICE"
+                    )
+                    if not SHAKUDO_GRAPH_TOOL_MICROSERVICE:
+                        raise ValueError(
+                            "SHAKUDO_NEO4J_GRAPH_TOOL_MICROSERVICE environment variable is not set"
+                        )
+                    payload = {
+                        "file_name": file.filename,
+                        "file_hash": hash if hash else "",
+                        "content": str(text_content),
+                        "chat_id": "123",  # TODO: Need to propagate chat_id from the webui insta
+                    }
+                    response = requests.post(
+                        SHAKUDO_GRAPH_TOOL_MICROSERVICE, json=payload
+                    )
+                    response.raise_for_status()  # This will raise an exception for HTTP errors
+
+                    log.info("Successfully ingested file to neo4j.")
+                except requests.RequestException as e:
+                    log.error(f"Error ingesting file to neo4j: {str(e)}")
+                except ValueError as e:
+                    log.error(str(e))
+                except Exception as e:
+                    log.error(f"Unexpected error during neo4j ingestion: {str(e)}")
+            else:
+                log.info("Neo4J Ingestion not configured")
 
             if request.app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL:
                 Files.update_file_data_by_id(file.id, {"status": "completed"})
@@ -2106,7 +2128,6 @@ def search_web(
 async def process_web_search(
     request: Request, form_data: SearchForm, user=Depends(get_verified_user)
 ):
-
     urls = []
     result_items = []
 
@@ -2286,7 +2307,8 @@ async def query_doc_handler(
                 collection_name=form_data.collection_name,
                 collection_result=collection_results[form_data.collection_name],
                 query=form_data.query,
-                embedding_function=lambda query, prefix: request.app.state.EMBEDDING_FUNCTION(
+                embedding_function=lambda query,
+                prefix: request.app.state.EMBEDDING_FUNCTION(
                     query, prefix=prefix, user=user
                 ),
                 k=form_data.k if form_data.k else request.app.state.config.TOP_K,
@@ -2355,7 +2377,8 @@ async def query_collection_handler(
             return await query_collection_with_hybrid_search(
                 collection_names=form_data.collection_names,
                 queries=[form_data.query],
-                embedding_function=lambda query, prefix: request.app.state.EMBEDDING_FUNCTION(
+                embedding_function=lambda query,
+                prefix: request.app.state.EMBEDDING_FUNCTION(
                     query, prefix=prefix, user=user
                 ),
                 k=form_data.k if form_data.k else request.app.state.config.TOP_K,
@@ -2390,7 +2413,8 @@ async def query_collection_handler(
             return await query_collection(
                 collection_names=form_data.collection_names,
                 queries=[form_data.query],
-                embedding_function=lambda query, prefix: request.app.state.EMBEDDING_FUNCTION(
+                embedding_function=lambda query,
+                prefix: request.app.state.EMBEDDING_FUNCTION(
                     query, prefix=prefix, user=user
                 ),
                 k=form_data.k if form_data.k else request.app.state.config.TOP_K,
